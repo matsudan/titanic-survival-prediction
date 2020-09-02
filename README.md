@@ -5,7 +5,10 @@ Kaggle getting started competition
 * docker
 * docker-compose
 
-## Run Jupyter
+## Usage
+1. Launch Jupyter
 ```shell
 $ docker-compose up
 ```
+
+2. Access the UI link localhost:8888 with a token
