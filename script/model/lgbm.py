@@ -1,38 +1,13 @@
 # -*- coding: utf-8 -*-
-import numpy as np
-from sklearn.metrics import log_loss
+
 from sklearn.model_selection import StratifiedKFold
-import optuna.integration.lightgbm as lgb
+import optuna.integration.lightgbm as oplgb
+import lightgbm as lgb
+import numpy as np
+from sklearn.metrics import accuracy_score
 
 
-class TunerCVCheckpointCallback(object):
-    """Optuna の LightGBMTunerCV から学習済みモデルを取り出すためのコールバック"""
-
-    def __init__(self):
-        # オンメモリでモデルを記録しておく辞書
-        self.cv_boosters = {}
-
-    @staticmethod
-    def params_to_hash(params):
-        """パラメータを元に辞書のキーとなるハッシュを計算する"""
-        params_hash = hash(frozenset(params.items()))
-        return params_hash
-
-    def get_trained_model(self, params):
-        """パラメータをキーとして学習済みモデルを取り出す"""
-        params_hash = self.params_to_hash(params)
-        return self.cv_boosters[params_hash]
-
-    def __call__(self, env):
-        """LightGBM の各ラウンドで呼ばれるコールバック"""
-        # 学習に使うパラメータをハッシュ値に変換する
-        params_hash = self.params_to_hash(env.params)
-        # 初登場のパラメータならモデルへの参照を保持する
-        if params_hash not in self.cv_boosters:
-            self.cv_boosters[params_hash] = env.model
-
-
-def objectives(x_train, y_train, x_test, categorical_features):
+def tuning(x_train, y_train, categorical_features):
     params = {
         "objective": "binary",
         "metric": "binary_logloss",
@@ -40,22 +15,16 @@ def objectives(x_train, y_train, x_test, categorical_features):
         "boosting_type": "gbdt",
     }
 
-    lgb_train = lgb.Dataset(data=x_train, label=y_train, categorical_feature=categorical_features, free_raw_data=False)
+    lgb_train = oplgb.Dataset(data=x_train, label=y_train, categorical_feature=categorical_features,
+                              free_raw_data=False)
     print("lgb_train: ", lgb_train)
-    # lgb_eval = lgb.Dataset(x_val, y_val, reference=lgb_train, categorical_feature=categorical_features)
 
-    checkpoint_cb = TunerCVCheckpointCallback()
-    callbacks = [
-        checkpoint_cb,
-    ]
-
-    tuner = lgb.LightGBMTunerCV(
+    tuner = oplgb.LightGBMTunerCV(
         params,
         lgb_train,
         verbose_eval=100,
         early_stopping_rounds=100,
         folds=StratifiedKFold(n_splits=5, shuffle=True, random_state=0),
-        callbacks=callbacks,
     )
 
     tuner.run()
@@ -67,19 +36,52 @@ def objectives(x_train, y_train, x_test, categorical_features):
     for key, value in best_params.items():
         print("    {}: {}".format(key, value))
 
-    # NOTE: 念のためハッシュの衝突に備えて Trial の数と学習済みモデルの数を比較しておく
-    print("checkpoint_cb.cv_boosters: ", checkpoint_cb.cv_boosters)
-    print("tuner.study.trials: ", tuner.study.trials)
-    assert len(checkpoint_cb.cv_boosters) == len(tuner.study.trials) - 1
+    return tuner.best_params
 
-    # 最も良かったパラメータをキーにして学習済みモデルを取り出す
-    cv_booster = checkpoint_cb.get_trained_model(tuner.best_params)
-    print("cv_booster: ", cv_booster)
-    print("cv_booster.best_iteration: ",cv_booster.best_iteration)
 
-    y_pred_proba_list = cv_booster.predict(
-        x_test,
-        num_iteration=cv_booster.best_iteration
-    )
+def predict(best_params, x_train, y_train, x_test, categorical_features, sub):
+    y_preds = []
+    models = []
+    oof_train = np.zeros((len(x_train),))
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
 
-    print("y_pred_proba_list: ", y_pred_proba_list)
+    for fold_id, (train_index, valid_index) in enumerate(cv.split(x_train, y_train)):
+        X_tr = x_train.loc[train_index, :]
+        X_val = x_train.loc[valid_index, :]
+        y_tr = y_train[train_index]
+        y_val = y_train[valid_index]
+
+        lgb_train = lgb.Dataset(X_tr, y_tr, categorical_feature=categorical_features)
+        lgb_eval = lgb.Dataset(X_val, y_val, reference=lgb_train, categorical_feature=categorical_features)
+
+        model = lgb.train(
+            best_params,
+            lgb_train,
+            valid_sets=[lgb_train, lgb_eval],
+            verbose_eval=10,
+            num_boost_round=1000,
+            early_stopping_rounds=10
+        )
+
+        oof_train[valid_index] = model.predict(X_val, num_iteration=model.best_iteration)
+        y_pred = model.predict(x_test, num_iteration=model.best_iteration)
+
+        y_preds.append(y_pred)
+        models.append(model)
+
+    scores = [
+        m.best_score["valid_1"]["binary_logloss"] for m in models
+    ]
+    score = sum(scores) / len(scores)
+    print("===CV scores===")
+    print("scores: ", scores)
+    print("score: ", score)
+
+    y_pred_oof = (oof_train > 0.5).astype(int)
+    print("accuracy_score: ", accuracy_score(y_train, y_pred_oof))
+
+    y_sub = sum(y_preds) / len(y_preds)
+    y_sub = (y_sub > 0.5).astype(int)
+
+    sub["Survived"] = y_sub
+    sub.to_csv("../output/submission_lightgbm_skfold.csv", index=False)
