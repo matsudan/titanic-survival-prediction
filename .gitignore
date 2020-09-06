@@ -130,6 +130,7 @@ dmypy.json
 
 # intellij
 .idea
+.iml
 
 # data
 *.csv
