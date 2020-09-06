@@ -6,7 +6,7 @@ Kaggle getting started competition
 * docker
 * docker-compose
 
-## scripts
+### scripts
 * libomp (for Mac)
 
 ```shell
